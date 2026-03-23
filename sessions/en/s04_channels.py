@@ -353,7 +353,7 @@ class TelegramChannel(Channel):
         Uses long-polling (30s timeout) with offset tracking.
         Returns buffered messages (media groups, coalesced text) that are ready.
         """
-        result = self._api("getUpdates", offset=self._offset, timeout=5,
+        result = self._api("getUpdates", offset=self._offset, timeout=30,
                            allowed_updates=["message"])
         if not result or not isinstance(result, list):
             return self._flush_all()
