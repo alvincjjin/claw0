@@ -166,7 +166,7 @@ python en/s03_sessions.py
 # You > Tell me about Python generators
 # You > /new experiments
 # You > What is 2+2?
-# You > /switch my-p     (prefix match)
+# You > /switch 4d7c57df6412     (the id of my-project)
 
 # Check context usage
 # You > /context
