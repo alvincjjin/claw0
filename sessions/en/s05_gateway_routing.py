@@ -28,65 +28,168 @@ How to run:  cd claw0 && python en/s05_gateway_routing.py
 Requires .env:
     ANTHROPIC_API_KEY=sk-ant-xxxxx
     MODEL_ID=claude-sonnet-4-20250514
+
+Architecture:
+    - GatewayServer: WebSocket server with JSON-RPC 2.0 API for external clients
+    - BindingTable: 5-tier routing rules (peer > guild > account > channel > default)
+    - AgentManager: Manages multiple agents with different personalities
+    - Shared event loop: Enables async WebSocket while keeping sync CLI interface
 """
 
 # ---------------------------------------------------------------------------
 # Imports & Configuration
 # ---------------------------------------------------------------------------
+
+# Standard library imports for operating system, regex, system calls, JSON, time, async, threading
 import os, re, sys, json, time, asyncio, threading
-from pathlib import Path
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path  # Path manipulation for file operations
+from datetime import datetime, timezone  # Date/time handling for tools
+from dataclasses import dataclass, field  # Data classes for structured objects
+from typing import Any  # Type hints for flexible arguments
 
-from dotenv import load_dotenv
-from anthropic import Anthropic
+# Third-party imports for environment variables and Anthropic API
+from dotenv import load_dotenv  # Load environment variables from .env file
+from anthropic import Anthropic  # Anthropic Claude API client
 
+# Load environment variables from project root .env file
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
+# Model configuration - defaults to Claude Sonnet 4 if not specified
 MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
+
+# Anthropic API client - communicates with Claude for agent responses
+# Uses ANTHROPIC_BASE_URL if set (useful for proxy/custom endpoints)
 client = Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
 )
+
+# Workspace directory for agent data and memory files
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
+
+# Agent-specific directory for storing per-agent configuration and sessions
 AGENTS_DIR = WORKSPACE_DIR / ".agents"
 
 # ---------------------------------------------------------------------------
-# ANSI Colors
+# ANSI Colors for terminal output
 # ---------------------------------------------------------------------------
+
+# Color codes for readable console output
 CYAN, GREEN, YELLOW, DIM, RESET = "\033[36m", "\033[32m", "\033[33m", "\033[2m", "\033[0m"
 BOLD, MAGENTA, RED, BLUE = "\033[1m", "\033[35m", "\033[31m", "\033[34m"
+
+# Maximum characters to return from read_file tool (prevents huge outputs)
 MAX_TOOL_OUTPUT = 30000
 
 # ---------------------------------------------------------------------------
 # Agent ID Normalization
 # ---------------------------------------------------------------------------
 
+# Regex: Valid agent IDs - lowercase alphanumeric, underscores, hyphens, 1-64 chars
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# Regex: Invalid characters to replace with hyphen
 INVALID_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
+
+# Fallback when no valid ID provided
 DEFAULT_AGENT_ID = "main"
 
 def normalize_agent_id(value: str) -> str:
+    """
+    Normalize agent ID to valid format.
+    
+    Rules:
+    - Must be lowercase alphanumeric with optional underscores/hyphens
+    - 1-64 characters
+    - Invalid characters replaced with hyphens
+    - Empty or invalid returns "main" (default agent)
+    
+    Examples:
+        "Luna" -> "luna"
+        "SAGE" -> "sage"
+        "Invalid@#$" -> "invalid"
+        "" -> "main"
+    """
     trimmed = value.strip()
     if not trimmed:
         return DEFAULT_AGENT_ID
+    # If already valid format, just lowercase
     if VALID_ID_RE.match(trimmed):
         return trimmed.lower()
+    # Replace invalid chars with hyphens, lowercase, trim leading/trailing
     cleaned = INVALID_CHARS_RE.sub("-", trimmed.lower()).strip("-")[:64]
     return cleaned or DEFAULT_AGENT_ID
 
 # ---------------------------------------------------------------------------
+# ID Terminology Guide (IMPORTANT)
+# ---------------------------------------------------------------------------
+#
+# Understanding the different IDs in this routing system:
+#
+# agent_id   = The AI agent handling the message (application layer)
+#             Example: "luna", "sage", "sales-bot"
+#             -> Which LLM personality responds
+#
+# account_id = The bot account that received the message (infrastructure layer)
+#             Example: "telegram-bot-1", "feishu-primary", "sales-bot-token"
+#             -> Which Telegram/Feishu bot token was used
+#
+# peer_id    = The user who sent the message (message source)
+#             Example: "123456789" (Telegram user ID), "user@example.com"
+#             -> Who is talking to us
+#
+# guild_id   = The server/workspace (for Discord, Slack, Teams)
+#             Example: "123456789012345678" (Discord server ID), "T0123456789" (Slack workspace)
+#             -> Which server/workspace the message came from
+#
+# channel    = The platform/message source type
+#             Example: "telegram", "discord", "cli", "feishu"
+#             -> What kind of channel
+#
+# Example flow (Discord):
+#   User Alice (peer_id: 111) in Server X (guild_id: 999) sends message via Bot "my-bot" → routes to Agent "sage"
+#   - channel = "discord"
+#   - account_id = "my-bot" (which bot token received it)
+#   - guild_id = "999" (which Discord server)
+#   - peer_id = "111" (who sent it)
+#   - agent_id = "sage" (which AI handles it)
+#
+# Key insight:
+#   - One account_id can route to different agent_ids (different bots → same routing)
+#   - One agent_id can handle multiple account_ids (one AI, many bot accounts)
+#   - peer_id determines session isolation (separate conversations per user)
+#   - guild_id routes by server (e.g., support for Company A's Discord server)
+
+# ---------------------------------------------------------------------------
 # Binding: 5-Tier Route Resolution
 # ---------------------------------------------------------------------------
-# Tier 1: peer_id    -- route a specific user to an agent
-# Tier 2: guild_id   -- guild/server level
-# Tier 3: account_id -- bot account level
-# Tier 4: channel    -- entire channel (e.g. all Telegram)
-# Tier 5: default    -- fallback
+
+# Tier 1: peer_id    -- route a specific user to an agent (most specific)
+# Tier 2: guild_id   -- guild/server level (e.g., Discord server)
+# Tier 3: account_id -- bot account level (which bot account)
+# Tier 4: channel    -- entire channel (e.g. all Telegram users)
+# Tier 5: default    -- fallback when nothing else matches (least specific)
+
+# Resolution order: Tier 1 -> Tier 2 -> Tier 3 -> Tier 4 -> Tier 5
+# Within same tier, higher priority wins
 
 @dataclass
 class Binding:
+    """
+    A routing rule that maps incoming message attributes to an agent.
+    
+    Fields:
+        agent_id: Which agent should handle matching messages
+        tier: 1-5, lower = more specific (checked first)
+        match_key: What field to match (peer_id, guild_id, account_id, channel, default)
+        match_value: Value to match against (e.g., "telegram", "12345", "*")
+        priority: Within same tier, higher = preferred (default 0)
+    
+    Example bindings:
+        Binding(agent_id="sage", tier=1, match_key="peer_id", match_value="discord:admin-001", priority=10)
+        Binding(agent_id="sage", tier=4, match_key="channel", match_value="telegram")
+        Binding(agent_id="luna", tier=5, match_key="default", match_value="*")
+    """
     agent_id: str
     tier: int           # 1-5, lower = more specific
     match_key: str      # "peer_id" | "guild_id" | "account_id" | "channel" | "default"
@@ -94,19 +197,30 @@ class Binding:
     priority: int = 0   # within same tier, higher = preferred
 
     def display(self) -> str:
+        """Human-readable representation of the binding."""
         names = {1: "peer", 2: "guild", 3: "account", 4: "channel", 5: "default"}
         label = names.get(self.tier, f"tier-{self.tier}")
         return f"[{label}] {self.match_key}={self.match_value} -> agent:{self.agent_id} (pri={self.priority})"
 
 class BindingTable:
+    """
+    Manages routing bindings and resolves incoming messages to agents.
+    
+    The table is kept sorted by (tier, -priority) so resolve() can just
+    iterate in order - first match wins.
+    """
+    
     def __init__(self) -> None:
         self._bindings: list[Binding] = []
 
     def add(self, binding: Binding) -> None:
+        """Add a binding and re-sort the table."""
         self._bindings.append(binding)
+        # Sort by tier (ascending), then by priority (descending)
         self._bindings.sort(key=lambda b: (b.tier, -b.priority))
 
     def remove(self, agent_id: str, match_key: str, match_value: str) -> bool:
+        """Remove a specific binding. Returns True if something was removed."""
         before = len(self._bindings)
         self._bindings = [
             b for b in self._bindings
@@ -116,13 +230,35 @@ class BindingTable:
         return len(self._bindings) < before
 
     def list_all(self) -> list[Binding]:
+        """Return all bindings as a list."""
         return list(self._bindings)
 
     def resolve(self, channel: str = "", account_id: str = "",
                 guild_id: str = "", peer_id: str = "") -> tuple[str | None, Binding | None]:
-        """Walk tiers 1-5, first match wins. Returns (agent_id, matched_binding)."""
+        """
+        Walk tiers 1-5, first match wins.
+        
+        Args:
+            channel: Message channel type (e.g., "telegram", "discord", "cli")
+            account_id: Bot account that received the message (which bot token)
+                        Example: "sales-bot", "support-bot" (which Telegram bot)
+            guild_id: Server/workspace ID (for Discord servers, Slack workspaces)
+            peer_id: User who sent the message (the actual person)
+                     Example: "123456789" (Telegram user ID)
+            
+        Returns:
+            Tuple of (agent_id, matched_binding) or (None, None) if no match
+            
+        Matching logic:
+            - Tier 1 (peer_id): Exact match on peer_id, or "channel:peer_id" format
+            - Tier 2 (guild_id): Exact match on guild_id (Discord server)
+            - Tier 3 (account_id): Exact match on account_id (which bot account)
+            - Tier 4 (channel): Exact match on channel name (all users of a platform)
+            - Tier 5 (default): Always matches if reached (match_value="*")
+        """
         for b in self._bindings:
             if b.tier == 1 and b.match_key == "peer_id":
+                # Support "channel:peer_id" format for platform-specific user IDs
                 if ":" in b.match_value:
                     if b.match_value == f"{channel}:{peer_id}":
                         return b.agent_id, b
@@ -141,24 +277,51 @@ class BindingTable:
 # ---------------------------------------------------------------------------
 # Session Key Builder
 # ---------------------------------------------------------------------------
-# dm_scope controls DM isolation granularity:
-#   main                      -> agent:{id}:main
-#   per-peer                  -> agent:{id}:direct:{peer}
-#   per-channel-peer          -> agent:{id}:{ch}:direct:{peer}
-#   per-account-channel-peer  -> agent:{id}:{ch}:{acc}:direct:{peer}
+
+# dm_scope controls DM isolation granularity (how conversation history is split):
+#   main                      -> agent:{id}:main                   (one shared session per agent)
+#   per-peer                  -> agent:{id}:direct:{peer}        (one session per user)
+#   per-channel-peer          -> agent:{id}:{ch}:direct:{peer}   (separate per channel+user)
+#   per-account-channel-peer  -> agent:{id}:{ch}:{acc}:direct:{peer} (separate per bot+channel+user)
 
 def build_session_key(agent_id: str, channel: str = "", account_id: str = "",
                       peer_id: str = "", dm_scope: str = "per-peer") -> str:
+    """
+    Build a unique session key for conversation history tracking.
+    
+    The session key determines how conversation history is isolated between users.
+    Different dm_scope values provide different levels of isolation.
+    
+    Args:
+        agent_id: Which agent this session belongs to
+        channel: Message channel (cli, telegram, discord, etc.)
+        account_id: Bot account ID (for multi-bot setups)
+        peer_id: User identifier (who sent the message)
+        dm_scope: Isolation level (main, per-peer, per-channel-peer, per-account-channel-peer)
+        
+    Returns:
+        Session key string, e.g., "agent:luna:cli:default:direct:user123"
+        
+    Examples:
+        build_session_key("luna", channel="cli", peer_id="u1", dm_scope="per-peer")
+        -> "agent:luna:direct:u1"
+        
+        build_session_key("sage", channel="telegram", account_id="bot1", peer_id="u1", dm_scope="per-account-channel-peer")
+        -> "agent:sage:telegram:bot1:direct:u1"
+    """
     aid = normalize_agent_id(agent_id)
     ch = (channel or "unknown").strip().lower()
     acc = (account_id or "default").strip().lower()
     pid = (peer_id or "").strip().lower()
+    
+    # Build key based on isolation scope
     if dm_scope == "per-account-channel-peer" and pid:
         return f"agent:{aid}:{ch}:{acc}:direct:{pid}"
     if dm_scope == "per-channel-peer" and pid:
         return f"agent:{aid}:{ch}:direct:{pid}"
     if dm_scope == "per-peer" and pid:
         return f"agent:{aid}:direct:{pid}"
+    # Fallback: single shared session for the agent
     return f"agent:{aid}:main"
 
 # ---------------------------------------------------------------------------
@@ -215,9 +378,10 @@ class AgentManager:
                 if not aid or k.startswith(f"agent:{aid}:")}
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools - Functions the AI can call during conversation
 # ---------------------------------------------------------------------------
 
+# Tool definitions for Claude API (describe what tools exist and their schemas)
 TOOLS = [
     {"name": "read_file", "description": "Read the contents of a file.",
      "input_schema": {"type": "object", "required": ["file_path"],
@@ -227,6 +391,12 @@ TOOLS = [
 ]
 
 def _tool_read(file_path: str) -> str:
+    """
+    Tool handler: Read a file from the filesystem.
+    
+    Resolves path to absolute, checks existence, reads content.
+    Truncates output if file is larger than MAX_TOOL_OUTPUT (30000 chars).
+    """
     try:
         p = Path(file_path).resolve()
         if not p.exists():
@@ -238,12 +408,19 @@ def _tool_read(file_path: str) -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
+# Map tool names to their Python handler functions
 TOOL_HANDLERS: dict[str, Any] = {
     "read_file": lambda file_path: _tool_read(file_path),
     "get_current_time": lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
 }
 
 def process_tool_call(name: str, inp: dict) -> str:
+    """
+    Route a tool call to its handler function.
+    
+    Called when Claude API returns a tool_use response.
+    Returns the tool's output string to send back to the model.
+    """
     handler = TOOL_HANDLERS.get(name)
     if not handler:
         return f"Error: Unknown tool '{name}'"
@@ -256,13 +433,26 @@ def process_tool_call(name: str, inp: dict) -> str:
 # Shared Event Loop (persistent background thread)
 # ---------------------------------------------------------------------------
 
+# Why async? GatewayServer uses websockets which requires async/await.
+# Why a thread? The REPL is synchronous (input()), so we need a background
+# thread running the event loop to handle WebSocket connections while
+# the main thread handles CLI input.
+
 _event_loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 
 def get_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Get or create the shared event loop running in a background thread.
+    
+    The event loop is created once and runs forever in a daemon thread.
+    This allows sync code (REPL) to schedule async operations (WebSocket).
+    """
     global _event_loop, _loop_thread
+    # Return existing loop if it's running
     if _event_loop is not None and _event_loop.is_running():
         return _event_loop
+    # Create new event loop in a background thread
     _event_loop = asyncio.new_event_loop()
     def _run():
         asyncio.set_event_loop(_event_loop)
@@ -272,6 +462,12 @@ def get_event_loop() -> asyncio.AbstractEventLoop:
     return _event_loop
 
 def run_async(coro):
+    """
+    Run an async coroutine in the shared event loop from sync code.
+    
+    Uses run_coroutine_threadsafe to schedule the coroutine in the
+    background event loop, then blocks until result is ready.
+    """
     loop = get_event_loop()
     return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
