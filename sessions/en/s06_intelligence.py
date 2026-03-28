@@ -102,6 +102,9 @@ def print_section(title: str) -> None:
 # 1. Bootstrap File Loader
 # ---------------------------------------------------------------------------
 # Load modes: full (main agent) | minimal (sub-agent / cron) | none (bare)
+# Bootstrap files define the agent's identity, tools, memory, and behavior.
+# Files are loaded from the workspace directory and truncated to fit within
+# the model's context window limits.
 
 class BootstrapLoader:
 
@@ -118,6 +121,18 @@ class BootstrapLoader:
             return ""
 
     def truncate_file(self, content: str, max_chars: int = MAX_FILE_CHARS) -> str:
+        """Truncate content to fit within character limit.
+        
+        Attempts to truncate at a paragraph boundary (last newline before limit)
+        to avoid cutting mid-sentence. Falls back to hard limit if no newline found.
+        
+        Args:
+            content: Raw file content
+            max_chars: Maximum characters to allow
+        
+        Returns:
+            Truncated content with [...] notice appended
+        """
         if len(content) <= max_chars:
             return content
         cut = content.rfind("\n", 0, max_chars)
@@ -126,6 +141,22 @@ class BootstrapLoader:
         return content[:cut] + f"\n\n[... truncated ({len(content)} chars total, showing first {cut}) ...]"
 
     def load_all(self, mode: str = "full") -> dict[str, str]:
+        """Load all bootstrap files based on the specified mode.
+        
+        Modes:
+          - "full": Load all BOOTSTRAP_FILES (default, for main agent)
+          - "minimal": Load only AGENTS.md and TOOLS.md (for sub-agents)
+          - "none": Return empty dict (bare mode)
+        
+        Files are truncated individually and collectively to respect
+        MAX_FILE_CHARS and MAX_TOTAL_CHARS limits.
+        
+        Args:
+            mode: Loading mode - "full", "minimal", or "none"
+        
+        Returns:
+            Dictionary mapping filename to truncated content
+        """
         if mode == "none":
             return {}
         names = ["AGENTS.md", "TOOLS.md"] if mode == "minimal" else list(BOOTSTRAP_FILES)
@@ -167,6 +198,8 @@ def load_soul(workspace_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # A skill = a directory containing SKILL.md with frontmatter (name, description, invocation).
 # Scanned by priority; same-name skills are overridden by later directories.
+# Skills are loaded from multiple locations: workspace/skills, .skills, .agents/skills, etc.
+# Each skill provides extra capabilities the agent can invoke during conversation.
 
 class SkillsManager:
 
@@ -220,6 +253,22 @@ class SkillsManager:
         return found
 
     def discover(self, extra_dirs: list[Path] | None = None) -> None:
+        """Scan configured directories for available skills.
+        
+        Searches multiple locations in priority order. Later directories
+        override skills with the same name from earlier directories.
+        This allows user-defined skills to override defaults.
+        
+        Scan order:
+          1. Extra directories (if provided)
+          2. workspace/skills
+          3. workspace/.skills
+          4. workspace/.agents/skills
+          5. cwd/.agents/skills
+          6. cwd/skills
+        
+        Populates self.skills with discovered skill metadata.
+        """
         scan_order: list[Path] = []
         if extra_dirs:
             scan_order.extend(extra_dirs)
@@ -236,6 +285,15 @@ class SkillsManager:
         self.skills = list(seen.values())[:MAX_SKILLS]
 
     def format_prompt_block(self) -> str:
+        """Format skills as a markdown section for the system prompt.
+        
+        Creates a structured list of available skills with name, description,
+        invocation command, and body content. Truncates if total exceeds
+        MAX_SKILLS_PROMPT to stay within context limits.
+        
+        Returns:
+            Formatted markdown section, or empty string if no skills
+        """
         if not self.skills:
             return ""
         lines = ["## Available Skills", ""]
@@ -261,9 +319,17 @@ class SkillsManager:
 # 4. Memory System
 # ---------------------------------------------------------------------------
 # Two-tier storage:
-#   MEMORY.md       = evergreen facts (manually maintained)
-#   daily/{date}.jsonl = daily logs (written by agent tools)
-# Search uses TF-IDF + cosine similarity, pure Python.
+#   MEMORY.md       = evergreen facts (manually maintained by humans)
+#   daily/{date}.jsonl = daily logs (written by agent tools during conversation)
+# 
+# Search pipeline (hybrid_search method):
+#   1. Keyword search: TF-IDF vectorization + cosine similarity
+#   2. Vector search: Hash-based simulated embeddings + cosine similarity  
+#   3. Merge: Weighted combination of both channels (70% vector, 30% keyword)
+#   4. Temporal decay: Older memories get lower scores (exponential decay)
+#   5. MMR rerank: Maximal Marginal Relevance for diversity in results
+# 
+# All implemented in pure Python - no external APIs or vector databases needed.
 
 class MemoryStore:
 
@@ -297,6 +363,19 @@ class MemoryStore:
             return ""
 
     def _load_all_chunks(self) -> list[dict[str, str]]:
+        """Load all memory chunks for searching.
+        
+        Combines two memory sources:
+        1. Evergreen memory (MEMORY.md) - split by paragraphs
+        2. Daily logs (daily/*.jsonl) - each entry becomes a chunk
+        
+        Each chunk is a dict with:
+          - path: Source file/location identifier
+          - text: The actual content
+        
+        Returns:
+            List of all memory chunks ready for search
+        """
         chunks: list[dict[str, str]] = []
         evergreen = self.load_evergreen()
         if evergreen:
@@ -376,7 +455,18 @@ class MemoryStore:
     @staticmethod
     def _hash_vector(text: str, dim: int = 64) -> list[float]:
         """Simulated vector embedding using hash-based random projection.
-        No external API needed -- teaches the PATTERN of a second search channel."""
+        
+        Creates a deterministic embedding from text without external APIs.
+        Each token's hash bits determine +1 or -1 for each dimension.
+        This provides a second, orthogonal search channel to keyword matching.
+        
+        Args:
+            text: Input text to embed
+            dim: Vector dimensionality (default 64)
+        
+        Returns:
+            Normalized float vector representing the text
+        """
         tokens = MemoryStore._tokenize(text)
         vec = [0.0] * dim
         for token in tokens:
@@ -407,7 +497,25 @@ class MemoryStore:
         return inter / union if union else 0.0
 
     def _vector_search(self, query: str, chunks: list[dict[str, str]], top_k: int = 10) -> list[dict[str, Any]]:
-        """Search by simulated vector similarity."""
+        """Semantic vector search using hash-based embeddings.
+        
+        This is the semantic/meaning-based search channel:
+        - Create simulated embeddings using hash-based random projection
+        - Compute cosine similarity between query and chunk vectors
+        
+        Good for: Synonyms, related concepts, semantic similarity
+        
+        Note: This is a simplified local approach. Production systems
+        would use dense embeddings from transformer models.
+        
+        Args:
+            query: Search query string
+            chunks: List of memory chunks to search
+            top_k: Maximum results to return
+        
+        Returns:
+            Ranked list of chunks with scores
+        """
         q_vec = self._hash_vector(query)
         scored = []
         for chunk in chunks:
@@ -419,7 +527,24 @@ class MemoryStore:
         return scored[:top_k]
 
     def _keyword_search(self, query: str, chunks: list[dict[str, str]], top_k: int = 10) -> list[dict[str, Any]]:
-        """Reuse existing TF-IDF as the keyword channel, return ranked results."""
+        """Keyword search using TF-IDF vectorization and cosine similarity.
+        
+        This is the traditional information retrieval channel:
+        - Tokenize query and chunks
+        - Build document frequency (DF) counts across all chunks
+        - Compute TF-IDF vectors for query and each chunk
+        - Rank by cosine similarity between query and chunk vectors
+        
+        Good for: Exact term matches, specific keywords
+        
+        Args:
+            query: Search query string
+            chunks: List of memory chunks to search
+            top_k: Maximum results to return
+        
+        Returns:
+            Ranked list of chunks with scores
+        """
         query_tokens = self._tokenize(query)
         if not query_tokens:
             return []
@@ -463,7 +588,24 @@ class MemoryStore:
         vector_weight: float = 0.7,
         text_weight: float = 0.3,
     ) -> list[dict[str, Any]]:
-        """Merge vector and keyword results by weighted score combination."""
+        """Merge vector and keyword results by weighted score combination.
+        
+        Both search channels may return overlapping or different results.
+        This merges them using weighted scoring, where the same chunk appearing
+        in both channels gets combined scores.
+        
+        Default weights: 70% vector search, 30% keyword search.
+        Vector search tends to capture semantic similarity better.
+        
+        Args:
+            vector_results: Results from vector/semantic search
+            keyword_results: Results from TF-IDF keyword search
+            vector_weight: Weight for vector scores
+            text_weight: Weight for keyword scores
+        
+        Returns:
+            Merged and sorted results by combined score
+        """
         merged: dict[str, dict[str, Any]] = {}
         for r in vector_results:
             key = r["chunk"]["text"][:100]
@@ -480,7 +622,26 @@ class MemoryStore:
 
     @staticmethod
     def _temporal_decay(results: list[dict[str, Any]], decay_rate: float = 0.01) -> list[dict[str, Any]]:
-        """Apply exponential temporal decay to scores based on chunk age."""
+        """Apply exponential temporal decay to scores based on chunk age.
+        
+        Recent memories are more valuable than old ones. This applies an
+        exponential decay based on the age of the memory (extracted from
+        the file path, e.g., 2024-01-15.jsonl).
+        
+        Formula: score = score * exp(-decay_rate * age_days)
+        
+        With default decay_rate=0.01:
+          - 0 days old: 100% score
+          - 30 days old: 74% score  
+          - 100 days old: 37% score
+        
+        Args:
+            results: List of scored search results
+            decay_rate: Exponential decay constant (higher = faster decay)
+        
+        Returns:
+            Results with temporally decayed scores
+        """
         now = datetime.now(timezone.utc)
         for r in results:
             path = r["chunk"].get("path", "")
@@ -501,7 +662,22 @@ class MemoryStore:
         lambda_param: float = 0.7,
     ) -> list[dict[str, Any]]:
         """Maximal Marginal Relevance re-ranking for diversity.
-        MMR = lambda * relevance - (1-lambda) * max_similarity_to_selected"""
+        
+        MMR balances relevance (matching the query) with diversity (different from
+        already-selected results). This prevents duplicate or very similar memories
+        from dominating the top results.
+        
+        Formula: MMR = lambda * relevance - (1-lambda) * max_similarity_to_selected
+        
+        Higher lambda = more relevance, lower lambda = more diversity.
+        
+        Args:
+            results: List of scored search results
+            lambda_param: Balance between relevance and diversity (0.0 to 1.0)
+        
+        Returns:
+            Re-ranked list with improved diversity
+        """
         if len(results) <= 1:
             return results
         tokenized = [MemoryStore._tokenize(r["chunk"]["text"]) for r in results]
@@ -528,7 +704,17 @@ class MemoryStore:
         return reranked
 
     def hybrid_search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Full hybrid search pipeline: keyword -> vector -> merge -> decay -> MMR -> top_k"""
+        """Full hybrid search pipeline: keyword -> vector -> merge -> decay -> MMR -> top_k
+        
+        This method combines multiple search strategies for better recall:
+        1. Load all memory chunks (evergreen + daily logs)
+        2. Run keyword search (TF-IDF) - good for exact term matches
+        3. Run vector search (simulated embeddings) - good for semantic similarity
+        4. Merge results with weighted scoring (70% vector, 30% keyword)
+        5. Apply temporal decay - older memories score lower
+        6. MMR rerank - ensure diversity in top results
+        7. Return top_k results with truncated snippets
+        """
         chunks = self._load_all_chunks()
         if not chunks:
             return []
@@ -546,6 +732,11 @@ class MemoryStore:
         return result
 
     def get_stats(self) -> dict[str, Any]:
+        """Get memory system statistics.
+        
+        Returns:
+            Dictionary with evergreen character count, daily file count, and total entries
+        """
         evergreen = self.load_evergreen()
         daily_files = list(self.memory_dir.glob("*.jsonl")) if self.memory_dir.is_dir() else []
         total_entries = 0
@@ -560,16 +751,42 @@ class MemoryStore:
 # ---------------------------------------------------------------------------
 # Memory Tools
 # ---------------------------------------------------------------------------
+# These are the tool implementations exposed to the LLM.
+# Each function wraps a MemoryStore method with logging and result formatting.
 
 memory_store = MemoryStore(WORKSPACE_DIR)
 
 
 def tool_memory_write(content: str, category: str = "general") -> str:
+    """Tool: Save a memory entry to daily log.
+    
+    The agent calls this to persist important facts about the user,
+    conversation context, or learned preferences.
+    
+    Args:
+        content: The fact or observation to remember
+        category: Optional category (preference, fact, context, etc.)
+    
+    Returns:
+        Confirmation message with file location
+    """
     print_tool("memory_write", f"[{category}] {content[:60]}...")
     return memory_store.write_memory(content, category)
 
 
 def tool_memory_search(query: str, top_k: int = 5) -> str:
+    """Tool: Search stored memories for relevant information.
+    
+    The agent calls this to recall past conversations, user preferences,
+    or context from earlier in the session.
+    
+    Args:
+        query: Search query string
+        top_k: Maximum results to return (default 5)
+    
+    Returns:
+        Formatted search results with scores and snippets
+    """
     print_tool("memory_search", query)
     results = memory_store.hybrid_search(query, top_k)
     if not results:
@@ -580,6 +797,9 @@ def tool_memory_search(query: str, top_k: int = 5) -> str:
 # ---------------------------------------------------------------------------
 # Tool Definitions
 # ---------------------------------------------------------------------------
+# Tools allow the LLM to interact with external systems (memory, etc.).
+# Each tool has a name, description, and JSON input schema.
+# The model decides when to call tools based on the system prompt instructions.
 
 TOOLS = [
     {
@@ -618,6 +838,18 @@ TOOL_HANDLERS: dict[str, Any] = {
 
 
 def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Execute a tool call requested by the LLM.
+    
+    Looks up the handler function for the requested tool, validates arguments,
+    and executes it. Returns the tool's output as a string to send back to the model.
+    
+    Args:
+        tool_name: Name of the tool to execute
+        tool_input: Dictionary of arguments for the tool
+    
+    Returns:
+        Tool execution result as string, or error message
+    """
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Unknown tool '{tool_name}'"
@@ -632,6 +864,19 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 # 5. System Prompt Assembly (8 layers, rebuilt every turn)
 # ---------------------------------------------------------------------------
+# The system prompt is assembled from multiple sources every turn to provide
+# fresh context. Each layer adds specific information:
+#
+#   Layer 1: Identity    - Core identity (IDENTITY.md)
+#   Layer 2: Soul       - Personality traits (SOUL.md)  
+#   Layer 3: Tools      - Tool usage guidelines (TOOLS.md)
+#   Layer 4: Skills     - Available skills from discovery
+#   Layer 5: Memory     - Evergreen + auto-recalled memories
+#   Layer 6: Bootstrap  - HEARTBEAT, BOOTSTRAP, AGENTS, USER files
+#   Layer 7: Runtime    - Current time, model, channel, agent ID
+#   Layer 8: Channel    - Channel-specific hints (terminal, telegram, etc.)
+#
+# Earlier layers have stronger influence on model behavior.
 
 def build_system_prompt(
     mode: str = "full",
@@ -711,6 +956,19 @@ def build_system_prompt(
 # ---------------------------------------------------------------------------
 # 6. Agent Loop + REPL
 # ---------------------------------------------------------------------------
+# The agent runs in a loop, processing user input and calling the LLM.
+# REPL commands allow inspection of internal state without calling the model.
+#
+# Available commands:
+#   /soul       - Show SOUL.md content (personality)
+#   /skills     - List discovered skills
+#   /memory     - Show memory statistics
+#   /search <q> - Search memories manually
+#   /prompt     - Show full assembled system prompt
+#   /bootstrap  - Show loaded bootstrap files
+#
+# Auto-recall: Relevant memories are automatically searched and included
+# in the system prompt before each LLM call.
 
 def handle_repl_command(
     cmd: str,
@@ -790,6 +1048,18 @@ def handle_repl_command(
 
 
 def _auto_recall(user_message: str) -> str:
+    """Automatically search and recall relevant memories before each LLM call.
+    
+    Called with the user's message to find contextually relevant memories.
+    Results are formatted as a string to include in the system prompt.
+    This gives the model awareness of past conversations without explicit prompting.
+    
+    Args:
+        user_message: Current user input to use as search query
+    
+    Returns:
+        Formatted memory context string, or empty if no results
+    """
     results = memory_store.hybrid_search(user_message, top_k=3)
     if not results:
         return ""
@@ -797,6 +1067,17 @@ def _auto_recall(user_message: str) -> str:
 
 
 def agent_loop() -> None:
+    """Main REPL loop for interactive agent conversation.
+    
+    Initializes all components (bootstrap, skills, memory) on startup,
+    then enters a loop processing user input:
+      1. Parse and handle REPL commands (/soul, /skills, etc.)
+      2. Auto-recall relevant memories for context
+      3. Build system prompt with all layers
+      4. Call LLM with tools available
+      5. Handle tool calls (memory_write, memory_search)
+      6. Display response and repeat
+    """
     loader = BootstrapLoader(WORKSPACE_DIR)
     bootstrap_data = loader.load_all(mode="full")
 
@@ -890,6 +1171,11 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Entry point - validates environment and starts the agent loop.
+    
+    Checks for required environment variables (ANTHROPIC_API_KEY) and
+    workspace directory before launching the interactive REPL.
+    """
     if not os.getenv("ANTHROPIC_API_KEY"):
         print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
