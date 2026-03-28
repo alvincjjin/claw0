@@ -2,23 +2,96 @@
 Section 07: Heartbeat & Cron
 "Not just reactive -- proactive"
 
-A timer thread that checks "should I run?" and queues work into the same
-pipeline as user messages. Lane mutual exclusion gives user messages priority.
+This module implements TWO independent background services that run alongside
+the main user interaction loop:
 
-    Main Lane:      User Input --> lock.acquire() -------> LLM --> Print
-    Heartbeat Lane: Timer tick --> lock.acquire(False) -+
-                                                        |
-                                   acquired? --no--> skip (user has priority)
-                                      |yes
-                                  run agent --> dedup --> queue
-    Cron Service:   CRON.json --> tick() --> due? --> run_agent --> log
+1. HEARTBEAT (background agent):
+   - A periodic timer that runs an LLM agent to check on things proactively
+   - Reads instructions from HEARTBEAT.md in the workspace
+   - Uses long-term memory (MEMORY.md) for context
+   - Respects active hours (default 9 AM - 10 PM)
+   - Uses a non-blocking lock acquire to yield to user messages
 
-Usage:
+2. CRON (scheduled jobs):
+   - Reads job definitions from CRON.json in the workspace
+   - Supports three schedule types:
+     * "at" - run once at a specific ISO timestamp
+     * "every" - run at fixed intervals (e.g., every hour)
+     * "cron" - run on a cron expression (5-field)
+   - Auto-disables jobs after 5 consecutive errors
+   - Logs all runs to cron/cron-runs.jsonl
+
+LANE MUTUAL EXCLUSION (priority system):
+The lane_lock ensures user messages always win over background tasks.
+
+    Main Lane:      User Input --> lock.acquire() BLOCKING ----> LLM --> Print
+    Heartbeat Lane: Timer tick --> lock.acquire(BLOCKING=False) -+
+                                                                |
+                                            acquired? --no--> skip (user has priority)
+                                               |yes
+                                           run agent --> dedup --> queue
+
+When the user types, they acquire the lock blocking=True and wait until done.
+Heartbeat tries acquire(blocking=False) - if it fails, user is typing, skip this tick.
+
+OUTPUT QUEUING:
+Both heartbeat and cron append output to queues that are drained and printed
+at the start of each REPL loop iteration. This ensures output appears between
+user prompts without disrupting input.
+
+    Heartbeat output format: [BLUE][heartbeat][RESET] message
+    Cron output format:      [MAGENTA][cron][RESET] message
+
+WORKSPACE FILES:
+- HEARTBEAT.md     : Instructions for the heartbeat agent (what to check)
+- SOUL.md          : System prompt / personality definition
+- MEMORY.md        : Long-term memory store (persists across sessions)
+- CRON.json        : Job definitions (see schema below)
+- cron/cron-runs.jsonl : Execution log (auto-created)
+
+CRON.json SCHEMA:
+{
+  "jobs": [
+    {
+      "id": "unique-job-id",
+      "name": "Human readable name",
+      "enabled": true,
+      "schedule": {
+        "kind": "at|every|cron",
+        // for "at":    { "at": "2024-01-01T09:00:00" }
+        // for "every": { "every_seconds": 3600, "anchor": "2024-01-01T00:00:00" }
+        // for "cron":  { "expr": "0 * * * *" }
+      },
+      "payload": {
+        "kind": "agent_turn|system_event",
+        // for "agent_turn":  { "message": "Do something with the LLM" }
+        // for "system_event": { "text": "Plain text to output" }
+      },
+      "delete_after_run": false  // only for "at" jobs
+    }
+  ]
+}
+
+ENVIRONMENT VARIABLES:
+- ANTHROPIC_API_KEY     : Required. API key for Anthropic
+- MODEL_ID              : Model to use (default: claude-sonnet-4-20250514)
+- ANTHROPIC_BASE_URL    : Optional. Custom API endpoint
+- HEARTBEAT_INTERVAL    : Seconds between heartbeat checks (default: 1800 = 30 min)
+- HEARTBEAT_ACTIVE_START: Start hour for heartbeat (default: 9)
+- HEARTBEAT_ACTIVE_END  : End hour for heartbeat (default: 22)
+
+USAGE:
     cd claw0
-    python en/s07_heartbeat_cron.py
+    python sessions/en/s07_heartbeat_cron.py
 
-Requires: ANTHROPIC_API_KEY, MODEL_ID (configured in .env)
-Workspace files: HEARTBEAT.md, SOUL.md, MEMORY.md, CRON.json
+    REPL Commands:
+    /heartbeat         - Show heartbeat status and next run time
+    /trigger           - Manually trigger heartbeat (skip interval check)
+    /cron              - List all cron jobs with status
+    /cron-trigger <id> - Manually trigger a cron job by ID
+    /lanes             - Show lock status (is user currently typing?)
+    /help              - Show this help
+    quit / exit        - Exit the program
 """
 
 import json
@@ -55,34 +128,44 @@ CYAN, GREEN, YELLOW, DIM, RESET, BOLD = "\033[36m", "\033[32m", "\033[33m", "\03
 MAGENTA, RED, BLUE, ORANGE = "\033[35m", "\033[31m", "\033[34m", "\033[38;5;208m"
 
 def colored_prompt() -> str:
+    """Return the user input prompt with ANSI colors."""
     return f"{CYAN}{BOLD}You > {RESET}"
 
 def print_assistant(text: str) -> None:
+    """Print LLM response in green."""
     print(f"\n{GREEN}{BOLD}Assistant:{RESET} {text}\n")
 
 def print_info(text: str) -> None:
+    """Print informational message in dim gray."""
     print(f"{DIM}{text}{RESET}")
 
 def print_heartbeat(text: str) -> None:
+    """Print heartbeat service output in blue."""
     print(f"{BLUE}{BOLD}[heartbeat]{RESET} {text}")
 
 def print_cron(text: str) -> None:
+    """Print cron service output in magenta."""
     print(f"{MAGENTA}{BOLD}[cron]{RESET} {text}")
 
 # ---------------------------------------------------------------------------
 # Soul + Memory (simplified)
 # ---------------------------------------------------------------------------
+# SoulSystem: Loads the agent's personality/system prompt from SOUL.md
+# MemoryStore: Persistent key-value store for facts the agent should remember
+# These provide context to both the main agent and background services.
 
 class SoulSystem:
     def __init__(self, workspace: Path) -> None:
         self.soul_path = workspace / "SOUL.md"
 
     def load(self) -> str:
+        """Load agent personality/system prompt from SOUL.md."""
         if self.soul_path.exists():
             return self.soul_path.read_text(encoding="utf-8").strip()
         return "You are a helpful AI assistant."
 
     def build_system_prompt(self, extra: str = "") -> str:
+        """Build full system prompt: base personality + extra context."""
         parts = [self.load()]
         if extra:
             parts.append(extra)
@@ -90,21 +173,30 @@ class SoulSystem:
 
 
 class MemoryStore:
+    """Simple persistent key-value store for long-term memory.
+
+    Stores memories in MEMORY.md as plain text (one fact per line).
+    Used by both the main agent and background services for context.
+    """
+
     def __init__(self, workspace: Path) -> None:
         self.memory_path = workspace / "MEMORY.md"
 
     def load_evergreen(self) -> str:
+        """Load all stored memories as a single string."""
         if self.memory_path.exists():
             return self.memory_path.read_text(encoding="utf-8").strip()
         return ""
 
     def write_memory(self, content: str) -> str:
+        """Append new content to memory store. Returns status message."""
         existing = self.load_evergreen()
         updated = existing + "\n\n" + content.strip() if existing else content.strip()
         self.memory_path.write_text(updated, encoding="utf-8")
         return f"Memory saved ({len(content)} chars)"
 
     def search_memory(self, query: str) -> str:
+        """Search memories for lines containing query. Returns up to 10 matches."""
         text = self.load_evergreen()
         if not text:
             return "No memories found."
@@ -128,6 +220,8 @@ MEMORY_TOOLS = [
 # ---------------------------------------------------------------------------
 # Agent Helper -- single-turn LLM call (shared by heartbeat and cron)
 # ---------------------------------------------------------------------------
+# This is a convenience function used by both HeartbeatRunner and CronService
+# to invoke the LLM without tool support. Returns plain text response or error.
 
 def run_agent_single_turn(prompt: str, system_prompt: str | None = None) -> str:
     """Single-turn LLM call, no tools, returns plain text."""
@@ -144,6 +238,15 @@ def run_agent_single_turn(prompt: str, system_prompt: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # HeartbeatRunner
 # ---------------------------------------------------------------------------
+# Implements a proactive background agent that periodically checks "should I run?"
+# and executes tasks defined in HEARTBEAT.md if all preconditions are met.
+#
+# KEY DESIGN:
+# - Runs in a daemon thread that ticks every 1 second
+# - Checks 4 preconditions: file exists, not empty, interval elapsed, within active hours
+# - Uses non-blocking lock acquire to yield to user input (user always wins)
+# - Deduplication: skips output if identical to last run
+# - Queues meaningful output for display in the REPL loop
 
 class HeartbeatRunner:
     def __init__(
@@ -168,7 +271,17 @@ class HeartbeatRunner:
         self._memory = MemoryStore(workspace)
 
     def should_run(self) -> tuple[bool, str]:
-        """4 precondition checks. Lock is tested separately in _execute()."""
+        """Check 4 preconditions. Returns (can_run, reason).
+
+        Preconditions:
+        1. HEARTBEAT.md file must exist
+        2. HEARTBEAT.md must not be empty
+        3. Interval must have elapsed since last run
+        4. Current hour must be within active_hours range
+
+        Note: Lock status is NOT checked here - it's tested separately in _execute()
+        using non-blocking acquire to avoid waiting.
+        """
         if not self.heartbeat_path.exists():
             return False, "HEARTBEAT.md not found"
         if not self.heartbeat_path.read_text(encoding="utf-8").strip():
@@ -187,13 +300,26 @@ class HeartbeatRunner:
         return True, "all checks passed"
 
     def _parse_response(self, response: str) -> str | None:
-        """HEARTBEAT_OK means nothing to report."""
+        """Parse LLM response for heartbeat.
+
+        Special handling:
+        - "HEARTBEAT_OK" in response means nothing to report (skip output)
+        - Otherwise return stripped response, or None if empty
+        This lets the heartbeat agent explicitly signal "all good, nothing to do".
+        """
         if "HEARTBEAT_OK" in response:
             stripped = response.replace("HEARTBEAT_OK", "").strip()
             return stripped if len(stripped) > 5 else None
         return response.strip() or None
 
     def _build_heartbeat_prompt(self) -> tuple[str, str]:
+        """Build the prompt and system prompt for heartbeat agent.
+
+        Includes:
+        - Instructions from HEARTBEAT.md
+        - Memory context (known facts)
+        - Current timestamp for time-sensitive checks
+        """
         instructions = self.heartbeat_path.read_text(encoding="utf-8").strip()
         mem = self._memory.load_evergreen()
         extra = ""
@@ -203,7 +329,18 @@ class HeartbeatRunner:
         return instructions, self._soul.build_system_prompt(extra)
 
     def _execute(self) -> None:
-        """Execute one heartbeat run. Non-blocking lock acquire; yields if busy."""
+        """Execute one heartbeat run. Non-blocking lock acquire; yields if busy.
+
+        Flow:
+        1. Try non-blocking lock acquire (yields to user if they're typing)
+        2. Build prompt from HEARTBEAT.md + memory context + timestamp
+        3. Call LLM with instructions
+        4. Parse response - skip if "HEARTBEAT_OK" (nothing to report)
+        5. Deduplicate - skip if identical to last output
+        6. Queue output for display in REPL loop
+
+        This runs in the heartbeat daemon thread, not the main REPL thread.
+        """
         acquired = self.lane_lock.acquire(blocking=False)
         if not acquired:
             return
@@ -230,6 +367,11 @@ class HeartbeatRunner:
             self.lane_lock.release()
 
     def _loop(self) -> None:
+        """Main heartbeat daemon loop. Ticks every 1 second.
+
+        Checks should_run() preconditions, executes if all pass.
+        Catches exceptions to keep daemon running.
+        """
         while not self._stopped:
             try:
                 ok, _ = self.should_run()
@@ -240,6 +382,7 @@ class HeartbeatRunner:
             time.sleep(1.0)
 
     def start(self) -> None:
+        """Start the heartbeat daemon thread."""
         if self._thread is not None:
             return
         self._stopped = False
@@ -247,19 +390,27 @@ class HeartbeatRunner:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the heartbeat daemon thread gracefully."""
         self._stopped = True
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
 
     def drain_output(self) -> list[str]:
+        """Get and clear all queued output. Called at start of each REPL iteration."""
         with self._queue_lock:
             items = list(self._output_queue)
             self._output_queue.clear()
             return items
 
     def trigger(self) -> str:
-        """Manually trigger heartbeat, bypassing the interval check."""
+        """Manually trigger heartbeat, bypassing the interval check.
+
+        Used by the /trigger REPL command.
+        Still respects lane_lock - if user is typing, returns immediately.
+        Bypasses the interval and active_hours checks.
+        Returns a status message describing what happened.
+        """
         acquired = self.lane_lock.acquire(blocking=False)
         if not acquired:
             return "main lane occupied, cannot trigger"
@@ -286,6 +437,7 @@ class HeartbeatRunner:
             self.lane_lock.release()
 
     def status(self) -> dict[str, Any]:
+        """Return current heartbeat state for display via /heartbeat command."""
         now = time.time()
         elapsed = now - self.last_run_at if self.last_run_at > 0 else None
         next_in = max(0.0, self.interval - elapsed) if elapsed is not None else self.interval
@@ -306,8 +458,21 @@ class HeartbeatRunner:
 # ---------------------------------------------------------------------------
 # CronJob + CronService
 # ---------------------------------------------------------------------------
-# Schedule kinds: at (once) | every (fixed interval) | cron (5-field expr)
-# Auto-disable after N consecutive errors. Run log -> cron-runs.jsonl
+# CronService manages scheduled jobs defined in CRON.json.
+#
+# SCHEDULE TYPES:
+# - "at":     Run once at a specific timestamp, then optionally delete
+# - "every":  Run at fixed intervals (e.g., every 3600 seconds = 1 hour)
+# - "cron":   Run based on a standard 5-field cron expression
+#
+# AUTO-RECOVERY:
+# - Tracks consecutive errors per job
+# - Auto-disables job after CRON_AUTO_DISABLE_THRESHOLD (5) errors
+# - All executions are logged to cron/cron-runs.jsonl for debugging
+#
+# JOB TYPES (payload.kind):
+# - "agent_turn": Invoke the LLM with a custom message
+# - "system_event": Output plain text directly (no LLM call)
 
 CRON_AUTO_DISABLE_THRESHOLD = 5
 
@@ -337,6 +502,11 @@ class CronService:
         self.load_jobs()
 
     def load_jobs(self) -> None:
+        """Load jobs from CRON.json into memory.
+
+        Parses JSON, validates schedule kind (at/every/cron),
+        computes initial next_run_at for each job.
+        """
         self.jobs.clear()
         if not self.cron_file.exists():
             return
@@ -361,7 +531,13 @@ class CronService:
             self.jobs.append(job)
 
     def _compute_next(self, job: CronJob, now: float) -> float:
-        """Compute next run timestamp. Returns 0.0 if no further scheduling."""
+        """Compute next run timestamp. Returns 0.0 if no further scheduling.
+
+        Schedule type handling:
+        - "at": Parse ISO timestamp, return if in future, else 0.0 (done)
+        - "every": Calculate steps from anchor, return next interval boundary
+        - "cron": Use croniter library to get next match from expression
+        """
         cfg = job.schedule_config
         if job.schedule_kind == "at":
             try:
@@ -390,7 +566,16 @@ class CronService:
         return 0.0
 
     def tick(self) -> None:
-        """Called every second; checks and executes due jobs."""
+        """Called every second; checks and executes due jobs.
+
+        For each enabled job:
+        1. Check if next_run_at has passed (now >= next_run_at)
+        2. Execute the job via _run_job()
+        3. If "at" job and delete_after_run=True, mark for removal
+        4. After processing, remove any "at" jobs marked for deletion
+
+        This is called from the cron daemon thread every 1 second.
+        """
         now = time.time()
         remove_ids: list[str] = []
         for job in self.jobs:
@@ -403,6 +588,21 @@ class CronService:
             self.jobs = [j for j in self.jobs if j.id not in remove_ids]
 
     def _run_job(self, job: CronJob, now: float) -> None:
+        """Execute a single cron job.
+
+        JOB TYPES:
+        - "agent_turn": Call LLM with the message from payload
+        - "system_event": Output plain text directly (no LLM)
+
+        ERROR HANDLING:
+        - Increments consecutive_errors on failure
+        - Auto-disables job after 5 consecutive errors
+        - Logs all executions to cron/cron-runs.jsonl
+
+        QUEUE OUTPUT:
+        - Successful output is queued for display in REPL loop
+        - Format: "[job_name] output_text"
+        """
         payload = job.payload
         kind = payload.get("kind", "")
         output, status, error = "", "ok", ""
@@ -454,6 +654,7 @@ class CronService:
                 self._output_queue.append(f"[{job.name}] {output}")
 
     def trigger_job(self, job_id: str) -> str:
+        """Manually trigger a cron job by ID. Used by /cron-trigger command."""
         for job in self.jobs:
             if job.id == job_id:
                 self._run_job(job, time.time())
@@ -461,12 +662,14 @@ class CronService:
         return f"Job '{job_id}' not found"
 
     def drain_output(self) -> list[str]:
+        """Get and clear all queued output. Called at start of each REPL iteration."""
         with self._queue_lock:
             items = list(self._output_queue)
             self._output_queue.clear()
             return items
 
     def list_jobs(self) -> list[dict[str, Any]]:
+        """Return list of all jobs with status for /cron command display."""
         now = time.time()
         result = []
         for j in self.jobs:
@@ -483,6 +686,16 @@ class CronService:
 # ---------------------------------------------------------------------------
 # REPL + Agent Loop
 # ---------------------------------------------------------------------------
+# Main event loop that:
+# 1. Starts heartbeat and cron background services
+# 2. Drains and displays queued output from background services
+# 3. Handles REPL commands (/heartbeat, /cron, etc.)
+# 4. Processes user messages with blocking lock acquisition
+#
+# The loop structure ensures:
+# - Background output appears between prompts
+# - User messages always get priority (blocking acquire)
+# - Both services shut down cleanly on exit
 
 def print_repl_help() -> None:
     print_info("REPL commands:")
@@ -496,6 +709,23 @@ def print_repl_help() -> None:
 
 
 def agent_loop() -> None:
+    """Main REPL loop with integrated heartbeat and cron services.
+
+    Setup:
+    1. Create lane_lock for mutual exclusion (user vs background)
+    2. Initialize Soul and Memory systems
+    3. Start HeartbeatRunner daemon thread
+    4. Start CronService daemon thread
+
+    Each iteration:
+    1. Drain and print queued heartbeat/cron output
+    2. Read user input (or quit/exit)
+    3. Handle REPL commands (/heartbeat, /cron, etc.)
+    4. For user messages: acquire lock BLOCKING, process with LLM, release
+
+    The blocking acquire ensures user messages always complete without
+    interruption from background services.
+    """
     lane_lock = threading.Lock()
     soul = SoulSystem(WORKSPACE_DIR)
     memory = MemoryStore(WORKSPACE_DIR)
@@ -510,13 +740,16 @@ def agent_loop() -> None:
     heartbeat.start()
 
     cron_stop = threading.Event()
+
     def cron_loop() -> None:
+        """Daemon thread that ticks the cron service every second."""
         while not cron_stop.is_set():
             try:
                 cron_svc.tick()
             except Exception:
                 pass
             cron_stop.wait(timeout=1.0)
+
     threading.Thread(target=cron_loop, daemon=True, name="cron-tick").start()
 
     messages: list[dict] = []
@@ -525,6 +758,7 @@ def agent_loop() -> None:
     system_prompt = soul.build_system_prompt(extra)
 
     def handle_tool(name: str, inp: dict) -> str:
+        """Handle tool calls from the LLM. Supports memory_write and memory_search."""
         if name == "memory_write":
             return memory.write_memory(inp.get("content", ""))
         if name == "memory_search":
@@ -554,11 +788,12 @@ def agent_loop() -> None:
             break
         if not user_input:
             continue
-        if user_input.lower() in ("quit", "exit"):
+        cmd_lower = user_input.lower().lstrip("/")
+        if cmd_lower in ("quit", "exit"):
             print(f"{DIM}Goodbye.{RESET}")
             break
 
-        # REPL commands
+        # REPL commands (only for commands starting with /)
         if user_input.startswith("/"):
             parts = user_input.split(maxsplit=1)
             cmd = parts[0].lower()
@@ -599,6 +834,8 @@ def agent_loop() -> None:
             continue
 
         # User conversation: blocking acquire (user always wins)
+        # The blocking=True ensure we wait if heartbeat is running.
+        # Background services use blocking=False so they yield to user input.
         lane_lock.acquire()
         try:
             messages.append({"role": "user", "content": user_input})
@@ -618,6 +855,10 @@ def agent_loop() -> None:
 
                 messages.append({"role": "assistant", "content": response.content})
 
+                # Handle different stop reasons from the API:
+                # - end_turn: Normal response with text
+                # - tool_use: Model wants to call a tool (memory_write, memory_search)
+                # - Other: Handle gracefully
                 if response.stop_reason == "end_turn":
                     text = "".join(b.text for b in response.content if hasattr(b, "text"))
                     if text:
@@ -647,6 +888,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
+# Validates API key is present, then starts the agent loop.
+# Heartbeat and cron threads are started within agent_loop().
 
 def main() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
